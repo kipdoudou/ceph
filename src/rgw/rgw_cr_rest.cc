@@ -20,6 +20,7 @@ RGWCRHTTPGetDataCB::RGWCRHTTPGetDataCB(RGWCoroutinesEnv *_env, RGWCoroutine *_cr
 
 #define GET_DATA_WINDOW_SIZE 2 * 1024 * 1024
 
+// 读数据 存到 data 里，如果 data 超过4M，就 pause ，等待 claim_data
 int RGWCRHTTPGetDataCB::handle_data(bufferlist& bl, bool *pause) {
   if (data.length() < GET_DATA_WINDOW_SIZE / 2) {
     notified = false;
@@ -55,6 +56,7 @@ int RGWCRHTTPGetDataCB::handle_data(bufferlist& bl, bool *pause) {
   return 0;
 }
 
+// 将读到的 data 存到 dest 中
 void RGWCRHTTPGetDataCB::claim_data(bufferlist *dest, uint64_t max) {
   bool need_to_unpause = false;
 
@@ -147,6 +149,8 @@ int RGWStreamReadHTTPResourceCRF::read(bufferlist *out, uint64_t max_size, bool 
         yield caller->io_block(0, io_read_mask);
       }
       got_attrs = true;
+      // sync_module_aws 中 need_extra_data() true
+      // 等待 in_cb has_all_extra_data, 就读取 headers
       if (need_extra_data() && !got_extra_data) {
         if (!in_cb->has_all_extra_data()) {
           continue;
@@ -293,6 +297,7 @@ int RGWStreamSpliceCR::operate() {
 
       ldout(cct, 20) << "read " << bl.length() << " bytes" << dendl;
 
+      // read到数据后，got_attrs 就会变为true
       if (!in_crf->has_attrs()) {
         assert (bl.length() == 0);
         continue;

@@ -24,6 +24,49 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
+/*
+使用libcurl访问外部http时的一个基本流程：
+
+
+1. curl_global_init(CURL_GLOBAL_ALL); //此函数只能调用一次
+
+ // 以下函数可以保证只调用一次
+ // long curl_global_flags = CURL_GLOBAL_ALL;
+ // std::call_once(curl_init_flag, curl_global_init, curl_global_flags);
+
+
+2. CURLM *curlm = curl_multi_init();
+
+3. 设置easy handle:
+CURL *curl1 = NULL;
+curl1 = curl_easy_init();
+curl_easy_setopt(curl1, CURLOPT_URL, "https://stackoverflow.com/");
+curl_easy_setopt(curl1, CURLOPT_WRITEFUNCTION, writeCallback);
+
+4. 将easy handle添加至multi handle:
+curl_multi_add_handle(curlm, curl1);
+
+5. 利用select监听读写事件
+curl_multi_fdset(handle, &fdread, &fdwrite, &fdexcep, &maxfd);
+select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
+
+6. 当有状态发生变化时：
+int mstatus = curl_multi_perform((CURLM *)multi_handle, &still_running);
+CURLMsg* msg = curl_multi_info_read((CURLM *)multi_handle, &msgs_left)
+
+// 读取easy handle信息
+
+curl_easy_getinfo();
+
+7. 从multi handle中清理easy handle:
+curl_multi_remove_handle((CURLM *)multi_handle, msg->easy_handle);
+
+8. 清理全局信息
+curl_multi_cleanup(multi_handle)
+curl_global_cleanup();
+
+*/
+
 RGWHTTPManager *rgw_http_manager;
 
 struct RGWCurlHandle;
@@ -31,23 +74,23 @@ struct RGWCurlHandle;
 static void do_curl_easy_cleanup(RGWCurlHandle *curl_handle);
 
 struct rgw_http_req_data : public RefCountedObject {
-  RGWCurlHandle *curl_handle{nullptr};
-  curl_slist *h{nullptr};
-  uint64_t id;
+  RGWCurlHandle *curl_handle{nullptr};   // easy handle
+  curl_slist *h{nullptr};                // http headers
+  uint64_t id;                           // 此client的id
   int ret{0};
-  std::atomic<bool> done = { false };
+  std::atomic<bool> done = { false };    // 标记此client事件是否完成
   RGWHTTPClient *client{nullptr};
-  rgw_io_id control_io_id;
-  void *user_info{nullptr};
-  bool registered{false};
+  rgw_io_id control_io_id;               // io id
+  void *user_info{nullptr};              // 设置的用户信息
+  bool registered{false};                // 标记是否已注册
   RGWHTTPManager *mgr{nullptr};
   char error_buf[CURL_ERROR_SIZE];
-  bool write_paused{false};
+  bool write_paused{false};              // client等待请求完成
   bool read_paused{false};
 
-  optional<int> user_ret;
+  optional<int> user_ret;                // 设置client请求结束返回的状态吗
 
-  ceph::mutex lock = ceph::make_mutex("rgw_http_req_data::lock");
+  ceph::mutex lock = ceph::make_mutex("rgw_http_req_data::lock");     // 同步,client IO是否完成
   ceph::condition_variable cond;
 
   using Signature = void(boost::system::error_code);
@@ -92,6 +135,7 @@ struct rgw_http_req_data : public RefCountedObject {
 
   void set_state(int bitmask);
 
+// finish: RGWHTTPManager 在client请求完成时，设置done，唤醒client；同时清理 curl_easy_init 返回的句柄，及 curl_slist 头部
   void finish(int r, long http_status = -1) {
     std::lock_guard l{lock};
     if (http_status != -1) {
@@ -134,9 +178,10 @@ struct rgw_http_req_data : public RefCountedObject {
   CURL *get_easy_handle() const;
 };
 
+// 对 CURL*(easy handle) 的一个简单封装
 struct RGWCurlHandle {
   int uses;
-  mono_time lastuse;
+  mono_time lastuse;  // 上次使用的时间
   CURL* h;
 
   explicit RGWCurlHandle(CURL* h) : uses(0), h(h) {};
@@ -155,22 +200,36 @@ void rgw_http_req_data::set_state(int bitmask) {
   }
 }
 
-#define MAXIDLE 5
+#define MAXIDLE 5   // 表示一个easy handle多长时间未使用，则重置此easy handle
+
+// RGWCurlHandle pool ，管理 RGWCurlHandle 的生成/释放。
 class RGWCurlHandles : public Thread {
 public:
   ceph::mutex cleaner_lock = ceph::make_mutex("RGWCurlHandles::cleaner_lock");
-  std::vector<RGWCurlHandle*> saved_curl;
-  int cleaner_shutdown;
+  std::vector<RGWCurlHandle*> saved_curl; // 存储RGWCurHandle
+  int cleaner_shutdown;                   // 清理easy interface，终止此线程
+  Cond cleaner_cond;
   ceph::condition_variable cleaner_cond;
 
   RGWCurlHandles() :
     cleaner_shutdown{0} {
   }
 
+  /*
+  ** 获取 curl handle
+  ** 如果 saved_curl 为空,则新建一个 easy handle ：
+  ** h = curl_easy_init();
+  ** curl = new RGWCurlHandle{h};
+  */
   RGWCurlHandle* get_curl_handle();
   void release_curl_handle_now(RGWCurlHandle* curl);
   void release_curl_handle(RGWCurlHandle* curl);
   void flush_curl_handles();
+
+  /*
+  ** 线程函数， loop 循环：
+  **    监听： cleaner_cond.wait_for(lock, std::chrono::seconds(MAXIDLE));
+  */
   void* entry();
   void stop();
 };
@@ -518,33 +577,62 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   _req_data->get();
   req_data = _req_data;
 
-  req_data->curl_handle = do_curl_easy_init();
+  req_data->curl_handle = do_curl_easy_init();  // 从RGWCurlhandlers中获取CURL*句柄(curl_easy_init初始化的对象)
 
   CURL *easy_handle = req_data->get_easy_handle();
 
   dout(20) << "sending request to " << url << dendl;
 
-  curl_slist *h = headers_to_slist(headers);
+  curl_slist *h = headers_to_slist(headers);  // 设置curl的头部信息
 
   req_data->h = h;
 
   curl_easy_setopt(easy_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
   curl_easy_setopt(easy_handle, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(easy_handle, CURLOPT_NOPROGRESS, 1L);
-  curl_easy_setopt(easy_handle, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(easy_handle, CURLOPT_HEADERFUNCTION, receive_http_header);
-  curl_easy_setopt(easy_handle, CURLOPT_WRITEHEADER, (void *)req_data);
-  curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, receive_http_data);
+  curl_easy_setopt(easy_handle, CURLOPT_NOPROGRESS, 1L);              /* 关闭进度条 */
+  curl_easy_setopt(easy_handle, CURLOPT_NOSIGNAL, 1L);                /* 屏蔽信号,不屏蔽 SIGPIPE 信号。在多线程中需要设置此选项，否则超时机制等产生的信号会导致进程crash */
+  curl_easy_setopt(easy_handle, CURLOPT_HEADERFUNCTION, receive_http_header);    /* receive headers的回调函数 */
+  curl_easy_setopt(easy_handle, CURLOPT_WRITEHEADER, (void *)req_data);          /* 设置Header的回调函数参数的最后一个参数 ? */
+  curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, receive_http_data);       /* 设置下载数据的回调函数 */
+
+  /* 
+  ** 设置write data回调函数参数的 userdata ，用来存储数据 
+  ** receive_http_data(void *ptr,size_t size,size_t nmemb,void *_info): ptr指向收到的数据，_info即为req_data。数据大小：size * nmemb,将ptr中的数据拷贝至req_data
+  */
   curl_easy_setopt(easy_handle, CURLOPT_WRITEDATA, (void *)req_data);
-  curl_easy_setopt(easy_handle, CURLOPT_ERRORBUFFER, (void *)req_data->error_buf);
+  curl_easy_setopt(easy_handle, CURLOPT_ERRORBUFFER, (void *)req_data->error_buf);    /* 错误信息的buffer */
+
+  /* 
+  ** rgw_curl_low_speed_time: 低速传输的时间
+  ** rgw_curl_low_speed_limit: 传输带宽限制
+  ** 传输速度 < rgw_curl_low_speed_limit，持续rgw_curl_low_speed_time，则放弃传输 
+  */
   curl_easy_setopt(easy_handle, CURLOPT_LOW_SPEED_TIME, cct->_conf->rgw_curl_low_speed_time);
   curl_easy_setopt(easy_handle, CURLOPT_LOW_SPEED_LIMIT, cct->_conf->rgw_curl_low_speed_limit);
+
+  /*
+  ** CURLOPT_READFUNCTION: data upload的回调函数
+  ** CURLOPT_READDATA: 数据读取的缓冲
+  ** send_http_data(void *ptr,size_t size,size_t nmemb,void *_info): _info为req_data, 将数据从req_data拷贝至ptr
+  */
   curl_easy_setopt(easy_handle, CURLOPT_READFUNCTION, send_http_data);
   curl_easy_setopt(easy_handle, CURLOPT_READDATA, (void *)req_data);
   curl_easy_setopt(easy_handle, CURLOPT_BUFFERSIZE, cct->_conf->rgw_curl_buffersize);
+
+  /*
+  ** 使能data upload功能
+  */
   if (send_data_hint || is_upload_request(method)) {
     curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L);
   }
+
+  /*
+  ** CURLOPT_INFILESIZE: 要传输的文件的大小
+  ** CURLOPT_POSTFIELDSIZE: 指向post data的数据大小
+  ** 在上传大于1024Bytes数据时，默认设置"Expect: 100-continue" ，使得libcurl传输数据之前预先和服务器协商，是否允许上传。但是在部分服务端会存在bug或不会应答此类包。
+  ** 因此设置 curl_slist_append(h, "Expect:") 空头，不让libcurl添加："Expect: 100-continue"
+  ** CURLOPT_HTTPHEADER: 利用设置的头部替代内部的头，如上设置了"Expect:" 替代默认的"Expect: 100-continue"
+  */
   if (has_send_len) {
     // TODO: prevent overflow by using curl_off_t
     // and: CURLOPT_INFILESIZE_LARGE, CURLOPT_POSTFIELDSIZE_LARGE
@@ -560,11 +648,23 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   if (h) {
     curl_easy_setopt(easy_handle, CURLOPT_HTTPHEADER, (void *)h);
   }
+
+  // 关闭ssl功能
   if (!verify_ssl) {
     curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYHOST, 0L);
     dout(20) << "ssl verification is set to off" << dendl;
   }
+
+  /*
+  ** 传递一个void* 的参数，这个参数存储私有的一些数据，关联至handler
+  ** 如下， curl_easy_setopt(easy_handle, CURLOPT_PRIVATE, (void *)req_data);客户端关联一个私有数据(req_data)至此handle
+  ** 利用curl_easy_getinfo,通过handle,取出此数据结构
+  **    rgw_http_req_data *req_data;
+  **    curl_easy_getinfo(e, CURLINFO_PRIVATE, (void **)&req_data); 
+  ** Note: 设置的是 req_data 指针，在 CURLOPT_WRITEDATA/CURLOPT_READDATA 中，传递的也是req_data的指针;在回调函数中，更新req_data内容；因此getinfo取出的req_data也是更新过的
+  ** CURLOPT_TIMEOUT: request 请求的超时时间设置
+  */
   curl_easy_setopt(easy_handle, CURLOPT_PRIVATE, (void *)req_data);
   curl_easy_setopt(easy_handle, CURLOPT_TIMEOUT, req_timeout);
 
@@ -754,6 +854,7 @@ static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
 
 #else
 
+// select 监听 multi handle 及 thead_pipe[0] 的文件描述符
 static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
 {
   fd_set fdread;
@@ -765,7 +866,9 @@ static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
   FD_ZERO(&fdwrite);
   FD_ZERO(&fdexcep);
 
-  /* get file descriptors from the transfers */ 
+  /* get file descriptors from the transfers 
+     获取 multi handle 中待处理的文件描述符
+  */ 
   int ret = curl_multi_fdset(handle, &fdread, &fdwrite, &fdexcep, &maxfd);
   if (ret) {
     ldout(cct, 0) << "ERROR: curl_multi_fdset returned " << ret << dendl;
@@ -831,7 +934,7 @@ RGWHTTPManager::~RGWHTTPManager() {
     curl_multi_cleanup((CURLM *)multi_handle);
 }
 
-void RGWHTTPManager::register_request(rgw_http_req_data *req_data)
+void n::register_request(rgw_http_req_data *req_data)
 {
   std::unique_lock rl{reqs_lock};
   req_data->id = num_reqs;
@@ -927,6 +1030,13 @@ void RGWHTTPManager::unlink_request(rgw_http_req_data *req_data)
   _unlink_request(req_data);
 }
 
+/**
+ * 处理 add_request 情况， reqs 无变化， unregistered_reqs/reqs_change_state 为空，则无需进一步处理
+ * 处理 unregistered_reqs 情况， _unlink_request(req_data),req_data.put()
+ * 重新链接 easy_interface 与 multi handle ,链接失败的添加如 remove_reqs 中
+ * 处理 set_request_state, 处理状态设置的情形
+ * 处理 remove_reqs ,调用 _finish_request(req_data,r), r为 link_request 返回的错误码
+ */
 void RGWHTTPManager::manage_pending_requests()
 {
   reqs_lock.lock_shared();
@@ -940,6 +1050,7 @@ void RGWHTTPManager::manage_pending_requests()
 
   std::unique_lock wl{reqs_lock};
 
+  /* 处理设置状态的设置 */
   if (!reqs_change_state.empty()) {
     for (auto siter : reqs_change_state) {
       _set_req_state(siter);
@@ -956,6 +1067,7 @@ void RGWHTTPManager::manage_pending_requests()
     unregistered_reqs.clear();
   }
 
+  /* 重新链接 */
   map<uint64_t, rgw_http_req_data *>::iterator iter = reqs.find(max_threaded_req);
 
   list<std::pair<rgw_http_req_data *, int> > remove_reqs;
@@ -971,6 +1083,7 @@ void RGWHTTPManager::manage_pending_requests()
     }
   }
 
+  /* 处理remove_reqs */
   for (auto piter : remove_reqs) {
     rgw_http_req_data *req_data = piter.first;
     int r = piter.second;
@@ -1159,14 +1272,18 @@ void *RGWHTTPManager::reqs_thread_entry()
   ldout(cct, 20) << __func__ << ": start" << dendl;
 
   while (!going_down) {
+    /* select实现对多个 easy_interface 及 thread_pipe[0] 的监听，当有读写发生时返回 */
     int ret = do_curl_wait(cct, (CURLM *)multi_handle, thread_pipe[0]);
     if (ret < 0) {
       dout(0) << "ERROR: do_curl_wait() returned: " << ret << dendl;
       return NULL;
     }
 
+    // 处理待处理的client队列
     manage_pending_requests();
 
+    // 对所有注册的client，执行回调函数，读取/发送数据等
+    // 执行 multi_handle 中，client的读写
     mstatus = curl_multi_perform((CURLM *)multi_handle, &still_running);
     switch (mstatus) {
       case CURLM_OK:
@@ -1174,21 +1291,31 @@ void *RGWHTTPManager::reqs_thread_entry()
         break;
       default:
         dout(10) << "curl_multi_perform returned: " << mstatus << dendl;
-	break;
+	    break;
     }
     int msgs_left;
     CURLMsg *msg;
-    while ((msg = curl_multi_info_read((CURLM *)multi_handle, &msgs_left))) {
-      if (msg->msg == CURLMSG_DONE) {
-	int result = msg->data.result;
-	CURL *e = msg->easy_handle;
-	rgw_http_req_data *req_data;
-	curl_easy_getinfo(e, CURLINFO_PRIVATE, (void **)&req_data);
-	curl_multi_remove_handle((CURLM *)multi_handle, e);
 
-	long http_status;
+    // 获取multi_handle中所有client的读写情况 
+    while ((msg = curl_multi_info_read((CURLM *)multi_handle, &msgs_left))) {
+
+      // 表示读写完成，获取对应的client
+      if (msg->msg == CURLMSG_DONE) {
+      	int result = msg->data.result;
+      	CURL *e = msg->easy_handle;
+
+        // 获取设置的私有数据: req_data 
+      	rgw_http_req_data *req_data;
+      	curl_easy_getinfo(e, CURLINFO_PRIVATE, (void **)&req_data);
+
+        // 删除multi_handle中的easy_interface
+      	curl_multi_remove_handle((CURLM *)multi_handle, e);
+
+        // req_data->user_ret: 在回调函数中设置，如req_data->user_ret = client->send_data()等，非0表示error
+      	long http_status;
         int status;
         if (!req_data->user_ret) {
+          // 获取client请求的http的返回码 
           curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, (void **)&http_status);
 
           status = rgw_http_error_to_errno(http_status);
@@ -1203,7 +1330,9 @@ void *RGWHTTPManager::reqs_thread_entry()
           http_status = err.http_ret;
         }
         int id = req_data->id;
-	finish_request(req_data, status, http_status);
+
+        /* 结束client的请求，调用req_data->finish()唤醒client；调用complete_request()，清理此reqs中的client */
+	      finish_request(req_data, status, http_status);
         switch (result) {
           case CURLE_OK:
             break;
@@ -1219,7 +1348,7 @@ void *RGWHTTPManager::reqs_thread_entry()
     }
   }
 
-
+  /* 资源清理 */
   std::unique_lock rl{reqs_lock};
   for (auto r : unregistered_reqs) {
     _unlink_request(r);
